@@ -95,26 +95,32 @@ def _update_mannequin(item, scene, global_scale, max_tilt_rad, delay_frames, cou
         tilt_axis  = mathutils.Vector((1.0, 0.0, 0.0))
         base_angle = 0.0
 
-    # ── Counter-movement: deceleration overshoot ──
-    # When accel opposes vel (dot < 0) the body swings forward past upright.
+    # ── Counter-movement: pendulum overshoot on deceleration ──
+    # When accel opposes vel (dot < 0) the character is braking.
+    # The body should swing FORWARD — in the direction of travel —
+    # like a pendulum that overshoots past upright.
+    # We express this as a positive rotation around the same tilt_axis
+    # (which normally produces the backward lean).  A positive angle on
+    # that axis tips the top of the body FORWARD, i.e. in the vel direction.
     accel_mag     = accel.length
     counter_angle = 0.0
-    counter_axis  = tilt_axis
 
-    if accel_mag > 0.00001 and counter_scale > 0.0:
+    if accel_mag > 0.00001 and counter_scale > 0.0 and speed > 0.00001:
         accel_dir = accel.normalized()
-        dot = vel_dir.dot(accel_dir) if speed > 0.00001 else 0.0
+        dot = vel_dir.dot(accel_dir)   # negative = decelerating
         if dot < -0.1:
-            counter_axis  = accel_dir.cross(z_up)
-            counter_angle = min(
-                accel_mag * item.sensitivity * counter_scale,
+            # strength proportional to how hard the brake is
+            brake_strength = abs(dot) * accel_mag
+            counter_angle  = min(
+                brake_strength * item.sensitivity * counter_scale,
                 max_tilt_rad,
             )
 
-    # ── Combine: base lean + counter overshoot ──
-    q_base    = mathutils.Quaternion(tilt_axis,    -base_angle)
-    q_counter = mathutils.Quaternion(counter_axis,  counter_angle)
-    body_obj.rotation_quaternion = q_base @ q_counter
+    # ── Combine: base lean backward, then overshoot forward on brake ──
+    # net_angle < 0  → leaning back (normal travel)
+    # net_angle > 0  → swung forward past upright (hard stop)
+    net_angle = -base_angle + counter_angle
+    body_obj.rotation_quaternion = mathutils.Quaternion(tilt_axis, net_angle)
 
 
 def mannequin_handler(scene):
