@@ -1,6 +1,6 @@
 # Simple Mannequin Animator
 
-![Simple Mannequin Animator](logo_easy-character-animator.jpg)
+![Simple Mannequin Animator](title_animation.gif)
 
 A Blender add-on for quick spring-physics character animation using simple head + body objects.
 
