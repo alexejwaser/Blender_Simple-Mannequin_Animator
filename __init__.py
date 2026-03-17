@@ -101,49 +101,32 @@ def _spring_step(state, target_angle, stiffness, damping):
 
 
 # ─────────────────────────────────────────────────────────────
-#  Build the world-space tilt axis from velocity + controller Z
+#  Build the world-space tilt axis purely from movement direction.
 #
-#  Strategy:
-#    1. Express the world velocity in the controller's local XY frame
-#       → gives "forward" direction relative to character facing
-#    2. The tilt axis is always 90° left of that local forward, then
-#       rotated back to world space by the controller's Z rotation.
-#
-#  This means:
-#    - A character moving straight forward leans back along its own Y axis.
-#    - A character moving sideways leans along its own X axis.
-#    - Curves produce smooth, continuously-rotating tilt axes.
+#  The controller's Z rotation (head facing) is intentionally ignored.
+#  Tilt is always opposite to the direction of travel in world space,
+#  so a character can move sideways or backwards without the tilt
+#  snapping to the head orientation.
 # ─────────────────────────────────────────────────────────────
 
-def _tilt_axis_world(vel_world, ctrl_z_rot):
+def _tilt_axis_world(vel_world):
     """
-    Returns the world-space unit vector around which the body tilts,
-    given world velocity and the controller's Z rotation angle.
+    Returns the world-space unit vector around which the body tilts.
+    The axis is 90° perpendicular to the XY velocity (cross with +Z),
+    so the body leans directly opposite the travel direction regardless
+    of which way the head/controller is rotated.
     """
-    # Rotate velocity into controller local space (un-rotate by z)
-    cos_r = math.cos(-ctrl_z_rot)
-    sin_r = math.sin(-ctrl_z_rot)
-    lx =  cos_r * vel_world.x - sin_r * vel_world.y
-    ly =  sin_r * vel_world.x + cos_r * vel_world.y
-
-    speed_2d = math.sqrt(lx * lx + ly * ly)
+    speed_2d = math.sqrt(vel_world.x ** 2 + vel_world.y ** 2)
     if speed_2d < 0.00001:
-        return None   # no movement — caller handles this
+        return None
 
-    # Local forward direction (normalised)
-    fx = lx / speed_2d
-    fy = ly / speed_2d
+    # Normalised travel direction in world XY
+    fx = vel_world.x / speed_2d
+    fy = vel_world.y / speed_2d
 
-    # Local tilt axis = 90° CCW of forward = (-fy, fx, 0)
-    tax_local = mathutils.Vector((-fy, fx, 0.0))
-
-    # Rotate back to world space by ctrl Z rotation
-    cos_f = math.cos(ctrl_z_rot)
-    sin_f = math.sin(ctrl_z_rot)
-    wx = cos_f * tax_local.x - sin_f * tax_local.y
-    wy = sin_f * tax_local.x + cos_f * tax_local.y
-
-    return mathutils.Vector((wx, wy, 0.0)).normalized()
+    # Tilt axis = 90° CCW of travel direction (cross of travel with +Z)
+    # cross(travel, +Z) = (fy*1 - 0, 0 - fx*1, 0) = (fy, -fx, 0)
+    return mathutils.Vector((fy, -fx, 0.0))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -194,7 +177,9 @@ def _update_mannequin(item, scene, props):
     if speed > 0.00001:
         raw_target   = +(speed * item.sensitivity * props.counter_rotation_scale)
         target_angle = max(-max_tilt, min(max_tilt, raw_target))
-        tilt_axis    = _tilt_axis_world(vel, ctrl_z)
+        tilt_axis    = _tilt_axis_world(vel)
+        if tilt_axis is not None:
+            state["last_axis"] = tilt_axis   # persist for oscillation after stop
     else:
         target_angle = 0.0
         tilt_axis    = None   # will reuse stored axis below
@@ -222,11 +207,8 @@ def _update_mannequin(item, scene, props):
     if tilt_axis is not None and abs(angle) > 0.0001:
         q_tilt = mathutils.Quaternion(tilt_axis, angle)
     elif tilt_axis is None and abs(angle) > 0.0001:
-        # Stopped but spring still oscillating — reuse last known axis
-        # encoded as: rotate the body-local Y axis by ctrl_z into world
-        cos_f = math.cos(ctrl_z)
-        sin_f = math.sin(ctrl_z)
-        last_axis = mathutils.Vector((-sin_f, cos_f, 0.0)).normalized()
+        # Stopped but spring still oscillating — reuse last stored world axis
+        last_axis = state.get("last_axis", mathutils.Vector((1.0, 0.0, 0.0)))
         q_tilt = mathutils.Quaternion(last_axis, angle)
     else:
         q_tilt = mathutils.Quaternion()   # identity
