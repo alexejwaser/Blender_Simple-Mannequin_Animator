@@ -126,7 +126,7 @@ def _tilt_axis_world(vel_world):
 
     # Tilt axis = 90° CCW of travel direction (cross of travel with +Z)
     # cross(travel, +Z) = (fy*1 - 0, 0 - fx*1, 0) = (fy, -fx, 0)
-    return mathutils.Vector((fy, -fx, 0.0))
+    return mathutils.Vector((-fy, fx, 0.0))
 
 
 # ─────────────────────────────────────────────────────────────
