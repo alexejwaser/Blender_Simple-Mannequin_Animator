@@ -1,11 +1,11 @@
 bl_info = {
     "name": "Mannequin Follow Lag",
     "author": "Custom",
-    "version": (2, 1, 0),
+    "version": (3, 0, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Mannequin",
     "description": (
-        "Body copies head XY position, rotates opposite to movement direction. "
+        "Body follows head with spring physics: tilt, overshoot, damped oscillation. "
         "Live via frame-change handler. Supports multiple mannequins."
     ),
     "category": "Animation",
@@ -15,62 +15,123 @@ import bpy
 import mathutils
 import math
 
+# ─────────────────────────────────────────────────────────────
+#  Spring state  (stored per mannequin, reset on backward scrub)
+#
+#  Each entry keyed by item.name:
+#    "angle"      – current tilt angle (radians, signed)
+#    "velocity"   – angular velocity (rad/frame)
+#    "axis"       – last non-zero tilt axis (Vector3)
+#    "last_frame" – frame we last updated on
+# ─────────────────────────────────────────────────────────────
+
+_spring_state: dict = {}
+_handler_running    = False
+
+
+def _get_state(key, scene):
+    """Return spring state dict for this key, initialising if missing."""
+    if key not in _spring_state:
+        _spring_state[key] = {
+            "angle":      0.0,
+            "velocity":   0.0,
+            "axis":       mathutils.Vector((1.0, 0.0, 0.0)),
+            "last_frame": scene.frame_current,
+        }
+    return _spring_state[key]
+
+
+def _reset_state(key):
+    if key in _spring_state:
+        del _spring_state[key]
+
 
 # ─────────────────────────────────────────────────────────────
-#  Core: sample head velocity and apply body transform
+#  Head sampling helpers
 # ─────────────────────────────────────────────────────────────
 
-# Guard against re-entrant frame_set calls inside the handler
-_handler_running = False
-
-
-def _sample_pos(head_obj, scene, frame):
-    """Sample head world XY position at a specific frame (clamped to range)."""
+def _sample_pos_xy(obj, scene, frame):
+    """World XY position of obj at frame (clamped to range)."""
     f = max(scene.frame_start, min(scene.frame_end, frame))
     scene.frame_set(f)
-    p = head_obj.matrix_world.to_translation().copy()
+    p = obj.matrix_world.to_translation()
     return mathutils.Vector((p.x, p.y, 0.0))
 
 
-def _get_head_motion(head_obj, scene, delay_frames):
+def _head_velocity_at(obj, scene, frame, delay):
+    """XY velocity vector at (frame - delay) via central difference."""
+    t       = frame - delay
+    p_prev  = _sample_pos_xy(obj, scene, t - 1)
+    p_next  = _sample_pos_xy(obj, scene, t + 1)
+    scene.frame_set(frame)          # restore
+    return (p_next - p_prev) * 0.5
+
+
+# ─────────────────────────────────────────────────────────────
+#  Spring step  (semi-implicit Euler, one frame at a time)
+#
+#  The spring equation:
+#      angle_accel = -stiffness * (angle - target) - damping * ang_vel
+#
+#  target_angle is determined by current head speed:
+#      - moving  → lean BACK  (negative angle by convention)
+#      - stopped → 0
+#  When the head decelerates hard, target suddenly flips toward 0 (or past 0),
+#  the spring overshoots and oscillates around 0 naturally.
+# ─────────────────────────────────────────────────────────────
+
+def _spring_step(state, target_angle, target_axis,
+                 stiffness, damping, dt=1.0):
     """
-    Return (velocity, acceleration) as XY vectors, evaluated at
-    (current_frame - delay_frames) using central differences.
-
-    velocity     = direction + speed of travel at the delayed frame
-    acceleration = change in velocity (negative dot velocity = decelerating)
+    Advance the spring by dt frames.
+    Returns (new_angle, new_axis).
     """
-    cur = scene.frame_current
-    t   = cur - delay_frames          # evaluate motion at this delayed frame
+    angle = state["angle"]
+    vel   = state["velocity"]
+    axis  = state["axis"]
 
-    p_prev2 = _sample_pos(head_obj, scene, t - 2)
-    p_prev  = _sample_pos(head_obj, scene, t - 1)
-    p_cur   = _sample_pos(head_obj, scene, t)
-    p_next  = _sample_pos(head_obj, scene, t + 1)
-    p_next2 = _sample_pos(head_obj, scene, t + 2)
+    # Blend axis smoothly so direction changes don't snap
+    # (only blend when the new axis is meaningful)
+    if target_axis.length > 0.5:
+        axis = axis.lerp(target_axis, 0.25).normalized()
 
-    # restore to actual current frame
-    scene.frame_set(cur)
+    # Spring force toward target
+    spring_force  = -stiffness * (angle - target_angle)
+    damping_force = -damping   * vel
+    accel         = spring_force + damping_force
 
-    # central-difference velocity at t-1, t, t+1
-    vel_prev = (p_cur   - p_prev2) * 0.5
-    vel_cur  = (p_next  - p_prev)  * 0.5
-    vel_next = (p_next2 - p_cur)   * 0.5
+    # Semi-implicit Euler
+    vel   = vel   + accel * dt
+    angle = angle + vel   * dt
 
-    # central-difference acceleration at t
-    accel = (vel_next - vel_prev) * 0.5
+    state["angle"]    = angle
+    state["velocity"] = vel
+    state["axis"]     = axis
 
-    return vel_cur, accel
+    return angle, axis
 
 
-def _update_mannequin(item, scene, global_scale, max_tilt_rad, delay_frames, counter_scale):
-    """Apply position + counter-rotation to one mannequin body."""
+# ─────────────────────────────────────────────────────────────
+#  Per-mannequin update
+# ─────────────────────────────────────────────────────────────
+
+def _update_mannequin(item, scene, props):
     head_obj = item.head_object
     body_obj = item.body_object
     if head_obj is None or body_obj is None:
         return
 
-    # ── Position: XY matches head, Z = head - offset ──
+    cur   = scene.frame_current
+    key   = item.name
+    state = _get_state(key, scene)
+
+    # ── Detect backward scrub → reset spring ──
+    if cur < state["last_frame"]:
+        _reset_state(key)
+        state = _get_state(key, scene)
+    state["last_frame"] = cur
+
+    # ── Position: XY = head, Z = head - offset ──
     h_world = head_obj.matrix_world.to_translation()
     body_obj.location = mathutils.Vector((
         h_world.x,
@@ -78,72 +139,58 @@ def _update_mannequin(item, scene, global_scale, max_tilt_rad, delay_frames, cou
         h_world.z - item.z_offset,
     ))
 
-    # ── Sample motion at (current - delay) ──
-    vel, accel = _get_head_motion(head_obj, scene, delay_frames)
+    # ── Head velocity (delayed) ──
+    vel   = _head_velocity_at(head_obj, scene, cur, props.delay_frames)
     speed = vel.length
 
-    body_obj.rotation_mode = 'QUATERNION'
     z_up = mathutils.Vector((0.0, 0.0, 1.0))
 
-    # ── Base tilt: lean opposite to velocity direction ──
+    # ── Target tilt angle ──
+    # Moving → lean back (negative).  Stopped → 0 (spring will oscillate).
+    max_tilt = math.radians(props.max_tilt_degrees)
+
     if speed > 0.00001:
-        vel_dir   = vel.normalized()
-        tilt_axis = vel_dir.cross(z_up)
-        base_angle = min(speed * item.sensitivity * global_scale, max_tilt_rad)
+        vel_dir      = vel.normalized()
+        target_axis  = vel_dir.cross(z_up).normalized()
+        raw_target   = -(speed * item.sensitivity * props.counter_rotation_scale)
+        target_angle = max(-max_tilt, min(max_tilt, raw_target))
     else:
-        vel_dir    = mathutils.Vector((0.0, 0.0, 0.0))
-        tilt_axis  = mathutils.Vector((1.0, 0.0, 0.0))
-        base_angle = 0.0
+        target_axis  = state["axis"]   # keep last axis, target = 0
+        target_angle = 0.0
 
-    # ── Counter-movement: pendulum overshoot on deceleration ──
-    # When accel opposes vel (dot < 0) the character is braking.
-    # The body should swing FORWARD — in the direction of travel —
-    # like a pendulum that overshoots past upright.
-    # We express this as a positive rotation around the same tilt_axis
-    # (which normally produces the backward lean).  A positive angle on
-    # that axis tips the top of the body FORWARD, i.e. in the vel direction.
-    accel_mag     = accel.length
-    counter_angle = 0.0
+    # ── Advance spring ──
+    angle, axis = _spring_step(
+        state,
+        target_angle,
+        target_axis,
+        stiffness = props.spring_stiffness,
+        damping   = props.spring_damping,
+    )
 
-    if accel_mag > 0.00001 and counter_scale > 0.0 and speed > 0.00001:
-        accel_dir = accel.normalized()
-        dot = vel_dir.dot(accel_dir)   # negative = decelerating
-        if dot < -0.1:
-            # strength proportional to how hard the brake is
-            brake_strength = abs(dot) * accel_mag
-            counter_angle  = min(
-                brake_strength * item.sensitivity * counter_scale,
-                max_tilt_rad,
-            )
+    # Clamp to max_tilt (hard stop, doesn't kill velocity)
+    angle = max(-max_tilt, min(max_tilt, angle))
 
-    # ── Combine: base lean backward, then overshoot forward on brake ──
-    # net_angle < 0  → leaning back (normal travel)
-    # net_angle > 0  → swung forward past upright (hard stop)
-    net_angle = -base_angle + counter_angle
-    body_obj.rotation_quaternion = mathutils.Quaternion(tilt_axis, net_angle)
+    # ── Apply rotation ──
+    body_obj.rotation_mode       = 'QUATERNION'
+    body_obj.rotation_quaternion = mathutils.Quaternion(axis, angle)
 
+
+# ─────────────────────────────────────────────────────────────
+#  Frame-change handler
+# ─────────────────────────────────────────────────────────────
 
 def mannequin_handler(scene):
-    """Frame-change handler: updates all registered mannequin bodies."""
     global _handler_running
     if _handler_running:
         return
     _handler_running = True
-
     try:
         mlist = scene.mannequin_list
         if not mlist:
             return
-
-        props         = scene.mannequin_props
-        global_scale  = props.counter_rotation_scale
-        max_tilt_rad  = math.radians(props.max_tilt_degrees)
-        delay_frames  = props.delay_frames
-        counter_scale = props.counter_movement_scale
-
+        props = scene.mannequin_props
         for item in mlist:
-            _update_mannequin(item, scene, global_scale, max_tilt_rad, delay_frames, counter_scale)
-
+            _update_mannequin(item, scene, props)
     finally:
         _handler_running = False
 
@@ -159,75 +206,85 @@ def _unregister_handler():
 
 
 # ─────────────────────────────────────────────────────────────
-#  Property Groups
+#  Properties
 # ─────────────────────────────────────────────────────────────
 
 def _on_global_change(self, context):
+    # Reset all spring states so changes feel immediate
+    _spring_state.clear()
     mannequin_handler(context.scene)
 
 
 class MannequinItem(bpy.types.PropertyGroup):
-    """Represents one head+body pair in the scene."""
-    name: bpy.props.StringProperty(name="Name", default="Mannequin")
-    head_object: bpy.props.PointerProperty(
-        name="Head", type=bpy.types.Object,
-        description="The animated controller object",
-    )
-    body_object: bpy.props.PointerProperty(
-        name="Body", type=bpy.types.Object,
-        description="The object that counter-rotates",
-    )
-    z_offset: bpy.props.FloatProperty(
+    name:        bpy.props.StringProperty(name="Name", default="Mannequin")
+    head_object: bpy.props.PointerProperty(name="Head", type=bpy.types.Object)
+    body_object: bpy.props.PointerProperty(name="Body", type=bpy.types.Object)
+    z_offset:    bpy.props.FloatProperty(
         name="Z Offset",
         description="Distance from head center down to body center",
         default=0.65, min=0.0, max=10.0, precision=3,
     )
     sensitivity: bpy.props.FloatProperty(
         name="Tilt ×",
-        description="Per-mannequin tilt sensitivity",
+        description="Per-mannequin tilt sensitivity multiplier",
         default=1.0, min=0.0, max=10.0, precision=2,
     )
 
 
 class MannequinProperties(bpy.types.PropertyGroup):
-    """Scene-level settings: reference objects + global tuning."""
+    # ── Reference ──
     ref_head: bpy.props.PointerProperty(
         name="Reference Head", type=bpy.types.Object,
-        description="Mesh to duplicate for each new mannequin head",
     )
     ref_body: bpy.props.PointerProperty(
         name="Reference Body", type=bpy.types.Object,
-        description="Mesh to duplicate for each new mannequin body",
     )
     ref_z_offset: bpy.props.FloatProperty(
-        name="Z Offset",
-        description="Vertical distance between head center and body center",
-        default=0.65, min=0.0, max=10.0, precision=3,
+        name="Z Offset", default=0.65, min=0.0, max=10.0, precision=3,
     )
+
+    # ── Tilt ──
     counter_rotation_scale: bpy.props.FloatProperty(
-        name="Global Tilt Scale",
-        description="Global multiplier for ALL mannequin tilts",
+        name="Tilt Scale",
+        description="How far the body leans during movement",
         default=3.0, min=0.0, max=20.0, step=10, precision=2,
         update=_on_global_change,
     )
     max_tilt_degrees: bpy.props.FloatProperty(
         name="Max Tilt °",
-        description="Maximum tilt angle (degrees) for all mannequins",
+        description="Hard clamp on tilt angle",
         default=35.0, min=0.0, max=90.0, step=100,
         update=_on_global_change,
     )
     delay_frames: bpy.props.IntProperty(
         name="Delay Frames",
-        description="How many frames behind the body reacts to head movement",
+        description="How many frames behind the body reacts",
         default=0, min=0, max=30,
         update=_on_global_change,
     )
-    counter_movement_scale: bpy.props.FloatProperty(
-        name="Counter Movement Scale",
-        description="How strongly the body overshoots on deceleration",
-        default=2.0, min=0.0, max=20.0, step=10, precision=2,
+
+    # ── Spring ──
+    spring_stiffness: bpy.props.FloatProperty(
+        name="Stiffness",
+        description=(
+            "How quickly the spring pulls back to the target angle. "
+            "High = snappy, low = slow/lazy"
+        ),
+        default=0.25, min=0.01, max=2.0, step=1, precision=3,
         update=_on_global_change,
     )
+    spring_damping: bpy.props.FloatProperty(
+        name="Damping",
+        description=(
+            "How fast oscillations die out. "
+            "1.0 = critically damped (no bounce), "
+            "< 0.3 = many swings, "
+            "> 1.0 = over-damped (slow creep)"
+        ),
+        default=0.35, min=0.01, max=2.0, step=1, precision=3,
+        update=_on_global_change,
+    )
+
     active_index: bpy.props.IntProperty(default=0)
 
 
@@ -252,20 +309,19 @@ class MANNEQUIN_OT_quick_build(bpy.types.Operator):
         bpy.ops.mesh.primitive_cylinder_add(radius=0.18, depth=0.70, location=(0, 0, 1.05))
         body      = context.active_object
         body.name = "MannequinRef_Body"
-        bev           = body.modifiers.new("Bevel", 'BEVEL')
-        bev.width     = 0.08
-        bev.segments  = 4
+        bev          = body.modifiers.new("Bevel", 'BEVEL')
+        bev.width    = 0.08
+        bev.segments = 4
 
         props.ref_head     = head
         props.ref_body     = body
         props.ref_z_offset = 0.65
-
-        self.report({'INFO'}, "Reference objects created. Assign them above, then click +.")
+        self.report({'INFO'}, "Reference objects created. Assign them, then click +.")
         return {'FINISHED'}
 
 
 class MANNEQUIN_OT_create(bpy.types.Operator):
-    """Duplicate the reference objects and register as a new mannequin."""
+    """Duplicate reference objects and register as a new mannequin."""
     bl_idname  = "mannequin.create"
     bl_label   = "Add Mannequin"
     bl_options = {'REGISTER', 'UNDO'}
@@ -280,17 +336,14 @@ class MANNEQUIN_OT_create(bpy.types.Operator):
 
         idx = len(scene.mannequin_list)
 
-        # ── Duplicate head ──
         bpy.ops.object.select_all(action='DESELECT')
         props.ref_head.select_set(True)
         context.view_layer.objects.active = props.ref_head
         bpy.ops.object.duplicate(linked=False)
         new_head      = context.active_object
         new_head.name = f"Mannequin_{idx:02d}_Head"
-        # Place slightly offset so duplicates don't stack
         new_head.location.x += idx * 1.0
 
-        # ── Duplicate body ──
         bpy.ops.object.select_all(action='DESELECT')
         props.ref_body.select_set(True)
         context.view_layer.objects.active = props.ref_body
@@ -298,15 +351,11 @@ class MANNEQUIN_OT_create(bpy.types.Operator):
         new_body      = context.active_object
         new_body.name = f"Mannequin_{idx:02d}_Body"
 
-        # Position body relative to head
         h_loc = new_head.location.copy()
         new_body.location = mathutils.Vector((
-            h_loc.x,
-            h_loc.y,
-            h_loc.z - props.ref_z_offset,
+            h_loc.x, h_loc.y, h_loc.z - props.ref_z_offset,
         ))
 
-        # ── Set body origin to head center (rotation anchor) ──
         saved_cursor          = scene.cursor.location.copy()
         scene.cursor.location = h_loc
         bpy.ops.object.select_all(action='DESELECT')
@@ -315,7 +364,6 @@ class MANNEQUIN_OT_create(bpy.types.Operator):
         bpy.ops.object.origin_set(type='ORIGIN_CURSOR')
         scene.cursor.location = saved_cursor
 
-        # ── Register ──
         item             = scene.mannequin_list.add()
         item.name        = new_head.name
         item.head_object = new_head
@@ -324,7 +372,6 @@ class MANNEQUIN_OT_create(bpy.types.Operator):
         item.sensitivity = 1.0
 
         props.active_index = len(scene.mannequin_list) - 1
-
         self.report({'INFO'}, f"Added {item.name}")
         return {'FINISHED'}
 
@@ -336,8 +383,7 @@ class MANNEQUIN_OT_remove(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     delete_objects: bpy.props.BoolProperty(
-        name="Also delete objects from scene",
-        default=False,
+        name="Also delete objects from scene", default=False,
     )
 
     def execute(self, context):
@@ -351,6 +397,8 @@ class MANNEQUIN_OT_remove(bpy.types.Operator):
             return {'CANCELLED'}
 
         item = mlist[idx]
+        _reset_state(item.name)
+
         if self.delete_objects:
             for ob in (item.head_object, item.body_object):
                 if ob:
@@ -365,6 +413,18 @@ class MANNEQUIN_OT_remove(bpy.types.Operator):
 
     def draw(self, context):
         self.layout.prop(self, "delete_objects")
+
+
+class MANNEQUIN_OT_reset_springs(bpy.types.Operator):
+    """Clear all spring simulation state (useful after big timeline jumps)."""
+    bl_idname = "mannequin.reset_springs"
+    bl_label  = "Reset Springs"
+
+    def execute(self, context):
+        _spring_state.clear()
+        mannequin_handler(context.scene)
+        self.report({'INFO'}, "Spring states cleared.")
+        return {'FINISHED'}
 
 
 class MANNEQUIN_OT_refresh(bpy.types.Operator):
@@ -415,8 +475,8 @@ class MANNEQUIN_PT_panel(bpy.types.Panel):
         # ── Reference ──
         box = layout.box()
         box.label(text="Reference Objects", icon='OBJECT_DATA')
-        box.prop(props, "ref_head",      icon='MESH_UVSPHERE')
-        box.prop(props, "ref_body",      icon='MESH_CYLINDER')
+        box.prop(props, "ref_head", icon='MESH_UVSPHERE')
+        box.prop(props, "ref_body", icon='MESH_CYLINDER')
         box.prop(props, "ref_z_offset")
         box.operator("mannequin.quick_build", icon='MODIFIER')
 
@@ -425,7 +485,6 @@ class MANNEQUIN_PT_panel(bpy.types.Panel):
         # ── Mannequin list ──
         box = layout.box()
         box.label(text="Mannequins", icon='ARMATURE_DATA')
-
         row = box.row()
         row.template_list(
             "MANNEQUIN_UL_list", "",
@@ -437,7 +496,6 @@ class MANNEQUIN_PT_panel(bpy.types.Panel):
         col.operator("mannequin.create", icon='ADD',    text="")
         col.operator("mannequin.remove", icon='REMOVE', text="")
 
-        # Per-item detail
         if 0 <= props.active_index < len(mlist):
             item = mlist[props.active_index]
             sub  = box.box()
@@ -449,14 +507,24 @@ class MANNEQUIN_PT_panel(bpy.types.Panel):
 
         layout.separator()
 
-        # ── Global tuning ──
+        # ── Global Tuning ──
         box = layout.box()
-        box.label(text="Global Tuning (all mannequins)", icon='PREFERENCES')
-        box.prop(props, "counter_rotation_scale",  slider=True)
-        box.prop(props, "max_tilt_degrees",         slider=True)
-        box.prop(props, "delay_frames",             slider=True)
-        box.prop(props, "counter_movement_scale",   slider=True)
-        box.operator("mannequin.refresh", icon='FILE_REFRESH')
+        box.label(text="Global Tuning", icon='PREFERENCES')
+
+        sub = box.box()
+        sub.label(text="Tilt", icon='ORIENTATION_GIMBAL')
+        sub.prop(props, "counter_rotation_scale", slider=True)
+        sub.prop(props, "max_tilt_degrees",        slider=True)
+        sub.prop(props, "delay_frames",            slider=True)
+
+        sub = box.box()
+        sub.label(text="Spring / Oscillation", icon='MOD_PHYSICS')
+        sub.prop(props, "spring_stiffness", slider=True)
+        sub.prop(props, "spring_damping",   slider=True)
+
+        row = box.row(align=True)
+        row.operator("mannequin.refresh",      icon='FILE_REFRESH')
+        row.operator("mannequin.reset_springs", icon='LOOP_BACK')
 
         layout.separator()
 
@@ -466,18 +534,19 @@ class MANNEQUIN_PT_panel(bpy.types.Panel):
         col.scale_y = 0.8
         col.label(text="Workflow:", icon='INFO')
         col.label(text="1. Assign Ref Head + Body (or Quick Default)")
-        col.label(text="2. Set Z Offset")
-        col.label(text="3. Press + to create new mannequin pairs")
-        col.label(text="4. Animate head objects — bodies update live")
-        col.label(text="5. Tune Global Tilt Scale / Max Tilt °")
+        col.label(text="2. Set Z Offset, press + to add mannequins")
+        col.label(text="3. Animate head objects — bodies update live")
+        col.label(text="4. Tune Tilt + Spring sliders globally")
+        col.label(text="5. Use Reset Springs after big timeline jumps")
 
 
 # ─────────────────────────────────────────────────────────────
-#  Persistent re-registration on file load
+#  Persistent handler re-registration on file load
 # ─────────────────────────────────────────────────────────────
 
 @bpy.app.handlers.persistent
 def _load_post_handler(dummy):
+    _spring_state.clear()
     _register_handler()
 
 
@@ -492,6 +561,7 @@ classes = (
     MANNEQUIN_OT_quick_build,
     MANNEQUIN_OT_create,
     MANNEQUIN_OT_remove,
+    MANNEQUIN_OT_reset_springs,
     MANNEQUIN_OT_refresh,
     MANNEQUIN_PT_panel,
 )
@@ -500,10 +570,8 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-
     bpy.types.Scene.mannequin_props = bpy.props.PointerProperty(type=MannequinProperties)
     bpy.types.Scene.mannequin_list  = bpy.props.CollectionProperty(type=MannequinItem)
-
     _register_handler()
     bpy.app.handlers.load_post.append(_load_post_handler)
 
@@ -512,10 +580,8 @@ def unregister():
     _unregister_handler()
     if _load_post_handler in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_load_post_handler)
-
     del bpy.types.Scene.mannequin_list
     del bpy.types.Scene.mannequin_props
-
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
