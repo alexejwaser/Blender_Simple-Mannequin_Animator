@@ -1,0 +1,23 @@
+schema_version = "1.0.0"
+
+id = "Simple_Mannequin_Animator"
+name = "Simple Mannequin Animator"
+tagline = "Body follows head with spring physics — tilt, overshoot, damped oscillation"
+version = "3.0.0"
+type = "add-on"
+
+maintainer = "alexejwsr"
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-2.0-or-later"]
+
+tags = ["Animation", "Object"]
+
+[build]
+paths_exclude_pattern = [
+    "__pycache__/",
+    "*.pyc",
+    ".git/",
+    ".DS_Store",
+]
