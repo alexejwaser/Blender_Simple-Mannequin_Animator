@@ -192,7 +192,7 @@ def _update_mannequin(item, scene, props):
 
     # ── Target tilt angle ──
     if speed > 0.00001:
-        raw_target   = -(speed * item.sensitivity * props.counter_rotation_scale)
+        raw_target   = +(speed * item.sensitivity * props.counter_rotation_scale)
         target_angle = max(-max_tilt, min(max_tilt, raw_target))
         tilt_axis    = _tilt_axis_world(vel, ctrl_z)
     else:
@@ -430,7 +430,7 @@ class MANNEQUIN_OT_create(bpy.types.Operator):
         scene.cursor.location = saved_cursor
 
         # ── Create controller Empty at head position ──
-        bpy.ops.object.empty_add(type='ARROWS', location=h_loc)
+        bpy.ops.object.empty_add(type='PLAIN_AXES', location=h_loc)
         ctrl           = context.active_object
         ctrl.name      = f"Mannequin_{idx:02d}_Ctrl"
         ctrl.empty_display_size = 0.3
@@ -441,6 +441,18 @@ class MANNEQUIN_OT_create(bpy.types.Operator):
         ctrl.select_set(True)
         context.view_layer.objects.active = ctrl
         bpy.ops.object.parent_set(type='OBJECT', keep_transform=True)
+
+        # ── Create a dedicated collection for this mannequin ──
+        col_name = f"Mannequin_{idx:02d}"
+        col = bpy.data.collections.new(col_name)
+        scene.collection.children.link(col)
+
+        # Move all three objects into the new collection
+        # (remove from whichever collections they currently live in first)
+        for ob in (ctrl, new_head, new_body):
+            for old_col in list(ob.users_collection):
+                old_col.objects.unlink(ob)
+            col.objects.link(ob)
 
         # ── Register ──
         item             = scene.mannequin_list.add()
@@ -453,7 +465,7 @@ class MANNEQUIN_OT_create(bpy.types.Operator):
 
         props.active_index = len(scene.mannequin_list) - 1
         self.report({'INFO'},
-            f"Created {ctrl.name}  ·  Animate the Empty to move the character.")
+            f"Created {ctrl.name} in collection '{col_name}'  ·  Animate the Empty.")
         return {'FINISHED'}
 
 
