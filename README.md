@@ -23,7 +23,7 @@ Animate an **Empty controller** — the head follows automatically, and the body
 ## Installation
 
 1. **Edit → Preferences → Add-ons → Install from Disk**
-2. Select `__init__.py` (or the zipped add-on folder)
+2. Select the downloaded zip-file
 3. Enable it — panel appears in **View3D → Sidebar → Mannequin**
 
 Requires Blender 4.0+.
