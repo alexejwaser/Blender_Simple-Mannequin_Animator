@@ -43,33 +43,49 @@ def _reset_state(key):
 
 # ─────────────────────────────────────────────────────────────
 #  Sampling helpers
+#
+#  IMPORTANT: We deliberately avoid scene.frame_set() inside the
+#  frame_change_post handler.  Calling frame_set() from that handler
+#  triggers a full depsgraph re-evaluation on every sample, which
+#  races with Blender's Line Art worker thread and causes a SIGSEGV
+#  in lineart_bounding_area_link_triangle (near-null pointer dereference
+#  into partially-built tile data structures).
+#
+#  Instead we use FCurve.evaluate() for velocity sampling — it
+#  interpolates animation curves mathematically without touching the
+#  depsgraph, the render pipeline, or any background threads.
 # ─────────────────────────────────────────────────────────────
 
-def _sample_ctrl(ctrl, scene, frame):
-    """
-    Sample the controller Empty at `frame` and return
-    (world_pos_xy_vec3, z_rotation_radians).
-    """
-    f = max(scene.frame_start, min(scene.frame_end, frame))
-    scene.frame_set(f)
-    mat  = ctrl.matrix_world
-    pos  = mat.to_translation()
-    # Extract Z euler from the matrix (stable regardless of rotation mode)
-    rot  = mat.to_euler('XYZ')
-    return mathutils.Vector((pos.x, pos.y, pos.z)), rot.z
+def _find_location_fcurves(ctrl):
+    """Return (fcurve_x, fcurve_y) for the controller's location, or (None, None)."""
+    action = (ctrl.animation_data and ctrl.animation_data.action)
+    if action is None:
+        return None, None
+    fx = fy = None
+    for fc in action.fcurves:
+        if fc.data_path == "location":
+            if fc.array_index == 0:
+                fx = fc
+            elif fc.array_index == 1:
+                fy = fc
+    return fx, fy
 
 
-def _ctrl_velocity(ctrl, scene, frame, delay):
+def _ctrl_velocity(ctrl, frame, delay):
     """
     World-space XY velocity of the controller at (frame - delay),
-    via central difference.  Returns Vector((vx, vy, 0)).
+    via central difference using FCurve.evaluate() — no scene.frame_set().
+    Returns Vector((vx, vy, 0)).
+    Falls back to zero vector when the controller has no animation data.
     """
     t = frame - delay
-    p_prev, _ = _sample_ctrl(ctrl, scene, t - 1)
-    p_next, _ = _sample_ctrl(ctrl, scene, t + 1)
-    scene.frame_set(frame)   # restore
-    d = p_next - p_prev
-    return mathutils.Vector((d.x * 0.5, d.y * 0.5, 0.0))
+    fx, fy = _find_location_fcurves(ctrl)
+    if fx is None or fy is None:
+        # No animation curves — controller is static, velocity is zero.
+        return mathutils.Vector((0.0, 0.0, 0.0))
+    dx = (fx.evaluate(t + 1) - fx.evaluate(t - 1)) * 0.5
+    dy = (fy.evaluate(t + 1) - fy.evaluate(t - 1)) * 0.5
+    return mathutils.Vector((dx, dy, 0.0))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -151,8 +167,10 @@ def _update_mannequin(item, scene, props):
         state = _get_state(key, scene)
     state["last_frame"] = cur
 
-    # ── Sample controller at current frame ──
-    ctrl_pos, ctrl_z = _sample_ctrl(ctrl_obj, scene, cur)
+    # ── Read controller state at current frame directly from the evaluated matrix.
+    #    No scene.frame_set() — we are already at `cur` inside frame_change_post.
+    ctrl_mat = ctrl_obj.matrix_world
+    ctrl_z   = ctrl_mat.to_euler('XYZ').z
 
     # ── Head: match controller XYZ position exactly, keep its own Z rotation ──
     # The head is parented to the ctrl Empty, so we only need to ensure
@@ -168,7 +186,7 @@ def _update_mannequin(item, scene, props):
     ))
 
     # ── Controller velocity (delayed) ──
-    vel   = _ctrl_velocity(ctrl_obj, scene, cur, props.delay_frames)
+    vel   = _ctrl_velocity(ctrl_obj, cur, props.delay_frames)
     speed = vel.length
 
     max_tilt = math.radians(props.max_tilt_degrees)
