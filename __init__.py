@@ -42,34 +42,50 @@ def _reset_state(key):
 
 
 # ─────────────────────────────────────────────────────────────
-#  Sampling helpers
+#  Velocity from world-position history
+#
+#  IMPORTANT: We deliberately avoid scene.frame_set() inside the
+#  frame_change_post handler.  Calling frame_set() from that handler
+#  triggers a full depsgraph re-evaluation on every sample, which
+#  races with Blender's Line Art worker thread and causes a SIGSEGV
+#  in lineart_bounding_area_link_triangle (near-null pointer dereference
+#  into partially-built tile data structures).
+#
+#  Instead we store the controller's evaluated world position at each
+#  frame in the spring state dict and derive velocity from that.
+#  This works for every animation setup (direct keyframes, NLA, drivers,
+#  constraints) and reads actual world-space coordinates.
 # ─────────────────────────────────────────────────────────────
 
-def _sample_ctrl(ctrl, scene, frame):
-    """
-    Sample the controller Empty at `frame` and return
-    (world_pos_xy_vec3, z_rotation_radians).
-    """
-    f = max(scene.frame_start, min(scene.frame_end, frame))
-    scene.frame_set(f)
-    mat  = ctrl.matrix_world
-    pos  = mat.to_translation()
-    # Extract Z euler from the matrix (stable regardless of rotation mode)
-    rot  = mat.to_euler('XYZ')
-    return mathutils.Vector((pos.x, pos.y, pos.z)), rot.z
-
-
-def _ctrl_velocity(ctrl, scene, frame, delay):
+def _ctrl_velocity(ctrl_world_pos, state, frame, delay):
     """
     World-space XY velocity of the controller at (frame - delay),
-    via central difference.  Returns Vector((vx, vy, 0)).
+    derived from the per-mannequin position history — no scene.frame_set().
+    Returns Vector((vx, vy, 0)).
+
+    History is keyed by frame number.  Central difference is used when
+    both (t-1) and (t+1) are available; forward difference otherwise.
     """
+    history = state.setdefault("pos_history", {})
+    history[frame] = (ctrl_world_pos.x, ctrl_world_pos.y)
+
+    # Prune entries no longer needed (keep delay + 2 frames of headroom)
+    keep_from = frame - max(delay + 2, 3)
+    for old_f in [k for k in list(history) if k < keep_from]:
+        del history[old_f]
+
     t = frame - delay
-    p_prev, _ = _sample_ctrl(ctrl, scene, t - 1)
-    p_next, _ = _sample_ctrl(ctrl, scene, t + 1)
-    scene.frame_set(frame)   # restore
-    d = p_next - p_prev
-    return mathutils.Vector((d.x * 0.5, d.y * 0.5, 0.0))
+    p_prev = history.get(t - 1)
+    p_next = history.get(t + 1)
+    p_cur  = history.get(t)
+
+    if p_prev is not None and p_next is not None:
+        return mathutils.Vector(((p_next[0] - p_prev[0]) * 0.5,
+                                 (p_next[1] - p_prev[1]) * 0.5, 0.0))
+    if p_prev is not None and p_cur is not None:
+        return mathutils.Vector((p_cur[0] - p_prev[0],
+                                 p_cur[1] - p_prev[1], 0.0))
+    return mathutils.Vector((0.0, 0.0, 0.0))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -151,8 +167,11 @@ def _update_mannequin(item, scene, props):
         state = _get_state(key, scene)
     state["last_frame"] = cur
 
-    # ── Sample controller at current frame ──
-    ctrl_pos, ctrl_z = _sample_ctrl(ctrl_obj, scene, cur)
+    # ── Read controller state at current frame directly from the evaluated matrix.
+    #    No scene.frame_set() — we are already at `cur` inside frame_change_post.
+    ctrl_mat       = ctrl_obj.matrix_world
+    ctrl_world_pos = ctrl_mat.to_translation()
+    ctrl_z         = ctrl_mat.to_euler('XYZ').z
 
     # ── Head: match controller XYZ position exactly, keep its own Z rotation ──
     # The head is parented to the ctrl Empty, so we only need to ensure
@@ -167,8 +186,18 @@ def _update_mannequin(item, scene, props):
         head_world.z - item.z_offset,
     ))
 
+    # ── Performance mode: skip spring/tilt for smooth viewport playback ──
+    # Only location and Z rotation are updated, keeping depsgraph updates
+    # minimal and avoiding the per-frame Line Art evaluation cascade.
+    if props.preview_mode:
+        body_obj.rotation_mode = 'QUATERNION'
+        body_obj.rotation_quaternion = mathutils.Quaternion(
+            mathutils.Vector((0.0, 0.0, 1.0)), ctrl_z
+        )
+        return
+
     # ── Controller velocity (delayed) ──
-    vel   = _ctrl_velocity(ctrl_obj, scene, cur, props.delay_frames)
+    vel   = _ctrl_velocity(ctrl_world_pos, state, cur, props.delay_frames)
     speed = vel.length
 
     max_tilt = math.radians(props.max_tilt_degrees)
@@ -327,6 +356,21 @@ class MannequinProperties(bpy.types.PropertyGroup):
     )
 
     active_index: bpy.props.IntProperty(default=0)
+
+    # ── Performance mode (hides GP/Line-Art objects, disables spring for fast playback) ──
+    preview_mode: bpy.props.BoolProperty(
+        name="Performance Mode",
+        description=(
+            "Hides Grease Pencil objects and disables spring physics for "
+            "smooth viewport playback. Switch back to Render Mode before rendering."
+        ),
+        default=False,
+    )
+    hidden_gp_objects: bpy.props.StringProperty(
+        name="Hidden GP Objects",
+        description="Newline-separated names of objects hidden by Performance Mode",
+        default="",
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -490,6 +534,50 @@ class MANNEQUIN_OT_remove(bpy.types.Operator):
         self.layout.prop(self, "delete_objects")
 
 
+class MANNEQUIN_OT_toggle_preview(bpy.types.Operator):
+    """
+    Performance Mode: hides all Grease Pencil objects and disables spring
+    physics for smooth viewport playback. Switch back to Render Mode before
+    rendering to restore Line Art and full spring simulation.
+    """
+    bl_idname  = "mannequin.toggle_preview"
+    bl_label   = "Toggle Performance Mode"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.mannequin_props
+
+        if not props.preview_mode:
+            # ── Enter preview mode: hide all visible GP objects ──
+            hidden = []
+            for obj in context.scene.objects:
+                if obj.type in ('GREASEPENCIL', 'GPENCIL') and not obj.hide_viewport:
+                    obj.hide_viewport = True
+                    hidden.append(obj.name)
+            props.hidden_gp_objects = "\n".join(hidden)
+            props.preview_mode = True
+            self.report({'INFO'},
+                f"Performance mode ON — hid {len(hidden)} Grease Pencil object(s), "
+                "spring physics disabled. Switch back before rendering.")
+        else:
+            # ── Exit preview mode: restore previously hidden GP objects ──
+            restored = 0
+            for name in props.hidden_gp_objects.split("\n"):
+                name = name.strip()
+                if name and name in bpy.data.objects:
+                    bpy.data.objects[name].hide_viewport = False
+                    restored += 1
+            props.hidden_gp_objects = ""
+            props.preview_mode = False
+            # Reset spring state so physics starts clean from the current frame
+            _spring_state.clear()
+            self.report({'INFO'},
+                f"Render mode ON — restored {restored} Grease Pencil object(s), "
+                "spring physics re-enabled.")
+
+        return {'FINISHED'}
+
+
 class MANNEQUIN_OT_reset_springs(bpy.types.Operator):
     """Clear all spring states (use after big timeline jumps)."""
     bl_idname = "mannequin.reset_springs"
@@ -616,6 +704,20 @@ class MANNEQUIN_PT_panel(bpy.types.Panel):
         col.label(text="4. Tune Tilt + Spring sliders globally")
         col.label(text="5. Reset Springs after big timeline jumps")
 
+        layout.separator()
+
+        # ── Preview / Render mode toggle ──
+        row = layout.row(align=True)
+        row.alert = props.preview_mode
+        if props.preview_mode:
+            row.operator("mannequin.toggle_preview",
+                         text="Exit Performance  →  Render Mode",
+                         icon='RESTRICT_VIEW_ON')
+        else:
+            row.operator("mannequin.toggle_preview",
+                         text="Performance Mode  (No Spring / Line Art)",
+                         icon='RESTRICT_VIEW_OFF')
+
 
 # ─────────────────────────────────────────────────────────────
 #  Persistent re-registration on file load
@@ -638,6 +740,7 @@ classes = (
     MANNEQUIN_OT_quick_build,
     MANNEQUIN_OT_create,
     MANNEQUIN_OT_remove,
+    MANNEQUIN_OT_toggle_preview,
     MANNEQUIN_OT_reset_springs,
     MANNEQUIN_OT_refresh,
     MANNEQUIN_PT_panel,
