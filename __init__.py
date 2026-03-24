@@ -42,7 +42,7 @@ def _reset_state(key):
 
 
 # ─────────────────────────────────────────────────────────────
-#  Sampling helpers
+#  Velocity from world-position history
 #
 #  IMPORTANT: We deliberately avoid scene.frame_set() inside the
 #  frame_change_post handler.  Calling frame_set() from that handler
@@ -51,41 +51,41 @@ def _reset_state(key):
 #  in lineart_bounding_area_link_triangle (near-null pointer dereference
 #  into partially-built tile data structures).
 #
-#  Instead we use FCurve.evaluate() for velocity sampling — it
-#  interpolates animation curves mathematically without touching the
-#  depsgraph, the render pipeline, or any background threads.
+#  Instead we store the controller's evaluated world position at each
+#  frame in the spring state dict and derive velocity from that.
+#  This works for every animation setup (direct keyframes, NLA, drivers,
+#  constraints) and reads actual world-space coordinates.
 # ─────────────────────────────────────────────────────────────
 
-def _find_location_fcurves(ctrl):
-    """Return (fcurve_x, fcurve_y) for the controller's location, or (None, None)."""
-    action = (ctrl.animation_data and ctrl.animation_data.action)
-    if action is None:
-        return None, None
-    fx = fy = None
-    for fc in action.fcurves:
-        if fc.data_path == "location":
-            if fc.array_index == 0:
-                fx = fc
-            elif fc.array_index == 1:
-                fy = fc
-    return fx, fy
-
-
-def _ctrl_velocity(ctrl, frame, delay):
+def _ctrl_velocity(ctrl_world_pos, state, frame, delay):
     """
     World-space XY velocity of the controller at (frame - delay),
-    via central difference using FCurve.evaluate() — no scene.frame_set().
+    derived from the per-mannequin position history — no scene.frame_set().
     Returns Vector((vx, vy, 0)).
-    Falls back to zero vector when the controller has no animation data.
+
+    History is keyed by frame number.  Central difference is used when
+    both (t-1) and (t+1) are available; forward difference otherwise.
     """
+    history = state.setdefault("pos_history", {})
+    history[frame] = (ctrl_world_pos.x, ctrl_world_pos.y)
+
+    # Prune entries no longer needed (keep delay + 2 frames of headroom)
+    keep_from = frame - max(delay + 2, 3)
+    for old_f in [k for k in list(history) if k < keep_from]:
+        del history[old_f]
+
     t = frame - delay
-    fx, fy = _find_location_fcurves(ctrl)
-    if fx is None or fy is None:
-        # No animation curves — controller is static, velocity is zero.
-        return mathutils.Vector((0.0, 0.0, 0.0))
-    dx = (fx.evaluate(t + 1) - fx.evaluate(t - 1)) * 0.5
-    dy = (fy.evaluate(t + 1) - fy.evaluate(t - 1)) * 0.5
-    return mathutils.Vector((dx, dy, 0.0))
+    p_prev = history.get(t - 1)
+    p_next = history.get(t + 1)
+    p_cur  = history.get(t)
+
+    if p_prev is not None and p_next is not None:
+        return mathutils.Vector(((p_next[0] - p_prev[0]) * 0.5,
+                                 (p_next[1] - p_prev[1]) * 0.5, 0.0))
+    if p_prev is not None and p_cur is not None:
+        return mathutils.Vector((p_cur[0] - p_prev[0],
+                                 p_cur[1] - p_prev[1], 0.0))
+    return mathutils.Vector((0.0, 0.0, 0.0))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -169,8 +169,9 @@ def _update_mannequin(item, scene, props):
 
     # ── Read controller state at current frame directly from the evaluated matrix.
     #    No scene.frame_set() — we are already at `cur` inside frame_change_post.
-    ctrl_mat = ctrl_obj.matrix_world
-    ctrl_z   = ctrl_mat.to_euler('XYZ').z
+    ctrl_mat       = ctrl_obj.matrix_world
+    ctrl_world_pos = ctrl_mat.to_translation()
+    ctrl_z         = ctrl_mat.to_euler('XYZ').z
 
     # ── Head: match controller XYZ position exactly, keep its own Z rotation ──
     # The head is parented to the ctrl Empty, so we only need to ensure
@@ -186,7 +187,7 @@ def _update_mannequin(item, scene, props):
     ))
 
     # ── Controller velocity (delayed) ──
-    vel   = _ctrl_velocity(ctrl_obj, cur, props.delay_frames)
+    vel   = _ctrl_velocity(ctrl_world_pos, state, cur, props.delay_frames)
     speed = vel.length
 
     max_tilt = math.radians(props.max_tilt_degrees)
