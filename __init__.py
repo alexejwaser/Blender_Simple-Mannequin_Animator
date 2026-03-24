@@ -347,6 +347,18 @@ class MannequinProperties(bpy.types.PropertyGroup):
 
     active_index: bpy.props.IntProperty(default=0)
 
+    # ── Preview mode (hides GP/Line-Art objects for fast playback) ──
+    preview_mode: bpy.props.BoolProperty(
+        name="Preview Mode",
+        description="Grease Pencil objects are currently hidden for faster playback",
+        default=False,
+    )
+    hidden_gp_objects: bpy.props.StringProperty(
+        name="Hidden GP Objects",
+        description="Newline-separated names of objects hidden by Preview Mode",
+        default="",
+    )
+
 
 # ─────────────────────────────────────────────────────────────
 #  Operators
@@ -509,6 +521,47 @@ class MANNEQUIN_OT_remove(bpy.types.Operator):
         self.layout.prop(self, "delete_objects")
 
 
+class MANNEQUIN_OT_toggle_preview(bpy.types.Operator):
+    """
+    Preview Mode: hide all Grease Pencil objects so Line Art is not evaluated
+    during playback, giving much faster viewport performance.
+    Switch back to Render Mode before rendering to restore them.
+    """
+    bl_idname  = "mannequin.toggle_preview"
+    bl_label   = "Toggle Preview Mode"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.mannequin_props
+
+        if not props.preview_mode:
+            # ── Enter preview mode: hide all visible GP objects ──
+            hidden = []
+            for obj in context.scene.objects:
+                if obj.type in ('GREASEPENCIL', 'GPENCIL') and not obj.hide_viewport:
+                    obj.hide_viewport = True
+                    hidden.append(obj.name)
+            props.hidden_gp_objects = "\n".join(hidden)
+            props.preview_mode = True
+            self.report({'INFO'},
+                f"Preview mode ON — hid {len(hidden)} Grease Pencil object(s). "
+                "Switch back before rendering.")
+        else:
+            # ── Exit preview mode: restore previously hidden GP objects ──
+            restored = 0
+            for name in props.hidden_gp_objects.split("\n"):
+                name = name.strip()
+                if name and name in bpy.data.objects:
+                    bpy.data.objects[name].hide_viewport = False
+                    restored += 1
+            props.hidden_gp_objects = ""
+            props.preview_mode = False
+            self.report({'INFO'},
+                f"Render mode ON — restored {restored} Grease Pencil object(s).")
+
+        return {'FINISHED'}
+
+
 class MANNEQUIN_OT_reset_springs(bpy.types.Operator):
     """Clear all spring states (use after big timeline jumps)."""
     bl_idname = "mannequin.reset_springs"
@@ -565,6 +618,18 @@ class MANNEQUIN_PT_panel(bpy.types.Panel):
         scene  = context.scene
         props  = scene.mannequin_props
         mlist  = scene.mannequin_list
+
+        # ── Preview / Render mode toggle ──
+        row = layout.row(align=True)
+        row.alert = props.preview_mode
+        if props.preview_mode:
+            row.operator("mannequin.toggle_preview", text="Exit Preview  →  Render Mode",
+                         icon='RESTRICT_VIEW_ON')
+        else:
+            row.operator("mannequin.toggle_preview", text="Preview Mode  (Hide Line Art)",
+                         icon='RESTRICT_VIEW_OFF')
+
+        layout.separator()
 
         # ── Reference ──
         box = layout.box()
@@ -657,6 +722,7 @@ classes = (
     MANNEQUIN_OT_quick_build,
     MANNEQUIN_OT_create,
     MANNEQUIN_OT_remove,
+    MANNEQUIN_OT_toggle_preview,
     MANNEQUIN_OT_reset_springs,
     MANNEQUIN_OT_refresh,
     MANNEQUIN_PT_panel,
