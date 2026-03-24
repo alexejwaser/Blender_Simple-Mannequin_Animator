@@ -180,20 +180,24 @@ def _update_mannequin(item, scene, props):
     head_world = head_obj.matrix_world.to_translation()
 
     # ── Body: position = head XY, Z = head - offset; Z rotation = controller ──
-    body_obj.location = mathutils.Vector((
+    new_loc = mathutils.Vector((
         head_world.x,
         head_world.y,
         head_world.z - item.z_offset,
     ))
+    body_obj.location = new_loc
 
     # ── Performance mode: skip spring/tilt for smooth viewport playback ──
     # Only location and Z rotation are updated, keeping depsgraph updates
     # minimal and avoiding the per-frame Line Art evaluation cascade.
     if props.preview_mode:
         body_obj.rotation_mode = 'QUATERNION'
-        body_obj.rotation_quaternion = mathutils.Quaternion(
-            mathutils.Vector((0.0, 0.0, 1.0)), ctrl_z
-        )
+        q = mathutils.Quaternion(mathutils.Vector((0.0, 0.0, 1.0)), ctrl_z)
+        body_obj.rotation_quaternion = q
+        # Cache transforms so render_pre can re-apply without re-advancing physics.
+        state["physics_frame"]  = cur
+        state["final_location"] = new_loc.copy()
+        state["final_rotation"] = q.copy()
         return
 
     # ── Controller velocity (delayed) ──
@@ -242,7 +246,13 @@ def _update_mannequin(item, scene, props):
     else:
         q_tilt = mathutils.Quaternion()   # identity
 
-    body_obj.rotation_quaternion = q_tilt @ q_z
+    final_q = q_tilt @ q_z
+    body_obj.rotation_quaternion = final_q
+
+    # Cache transforms so render_pre can re-apply without re-advancing physics.
+    state["physics_frame"]  = cur
+    state["final_location"] = new_loc.copy()
+    state["final_rotation"] = final_q.copy()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -273,6 +283,76 @@ def _register_handler():
 def _unregister_handler():
     if mannequin_handler in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.remove(mannequin_handler)
+
+
+# ─────────────────────────────────────────────────────────────
+#  Render-pre handler
+#
+#  Problem: during animation rendering Blender may perform an additional
+#  depsgraph evaluation *after* frame_change_post fires (to resolve
+#  constraints and drivers for the render engine). This extra evaluation
+#  can overwrite the body-object transforms we set in mannequin_handler,
+#  causing the renderer to capture the un-sprung default rotation instead
+#  of the spring-physics result — even though the viewport looks correct.
+#
+#  Fix: register a render_pre handler that re-applies the already-computed
+#  transforms (cached in _spring_state by _update_mannequin) immediately
+#  before the render engine captures each frame.  Because the transforms
+#  are read from the cache rather than re-simulated, the spring integrator
+#  is NOT stepped a second time, so the physics remain frame-accurate.
+# ─────────────────────────────────────────────────────────────
+
+@bpy.app.handlers.persistent
+def mannequin_render_pre(scene, depsgraph=None):
+    """Re-apply cached spring transforms before each rendered frame.
+
+    Fires once per rendered frame (including every frame of an animation
+    render). If frame_change_post already ran for this frame the cached
+    location/rotation is simply rewritten to the body object; if for any
+    reason it has not yet run, _update_mannequin is called normally so
+    that the frame is never silently skipped.
+    """
+    global _handler_running
+    if _handler_running:
+        return
+    _handler_running = True
+    try:
+        mlist = scene.mannequin_list
+        if not mlist:
+            return
+        props = scene.mannequin_props
+        cur   = scene.frame_current
+        for item in mlist:
+            key      = item.name
+            state    = _spring_state.get(key)
+            body_obj = item.body_object
+            if body_obj is None:
+                continue
+
+            if (state is not None
+                    and state.get("physics_frame") == cur
+                    and "final_location" in state
+                    and "final_rotation" in state):
+                # frame_change_post already computed & cached the result —
+                # just rewrite the body transforms so the renderer sees them.
+                body_obj.rotation_mode       = 'QUATERNION'
+                body_obj.location            = state["final_location"].copy()
+                body_obj.rotation_quaternion = state["final_rotation"].copy()
+            else:
+                # frame_change_post has not run yet for this frame; compute now.
+                _update_mannequin(item, scene, props)
+    finally:
+        _handler_running = False
+
+
+def _register_render_handler():
+    if mannequin_render_pre not in bpy.app.handlers.render_pre:
+        bpy.app.handlers.render_pre.append(mannequin_render_pre)
+
+
+def _unregister_render_handler():
+    if mannequin_render_pre in bpy.app.handlers.render_pre:
+        bpy.app.handlers.render_pre.remove(mannequin_render_pre)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -727,6 +807,7 @@ class MANNEQUIN_PT_panel(bpy.types.Panel):
 def _load_post_handler(dummy):
     _spring_state.clear()
     _register_handler()
+    _register_render_handler()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -753,11 +834,13 @@ def register():
     bpy.types.Scene.mannequin_props = bpy.props.PointerProperty(type=MannequinProperties)
     bpy.types.Scene.mannequin_list  = bpy.props.CollectionProperty(type=MannequinItem)
     _register_handler()
+    _register_render_handler()
     bpy.app.handlers.load_post.append(_load_post_handler)
 
 
 def unregister():
     _unregister_handler()
+    _unregister_render_handler()
     if _load_post_handler in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_load_post_handler)
     del bpy.types.Scene.mannequin_list
