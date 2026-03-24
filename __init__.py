@@ -186,6 +186,16 @@ def _update_mannequin(item, scene, props):
         head_world.z - item.z_offset,
     ))
 
+    # ── Preview mode: skip spring/tilt for smooth viewport playback ──
+    # Only location is updated (no rotation change), keeping depsgraph
+    # updates minimal and avoiding the per-frame Line Art evaluation cascade.
+    if props.preview_mode:
+        body_obj.rotation_mode = 'QUATERNION'
+        body_obj.rotation_quaternion = mathutils.Quaternion(
+            mathutils.Vector((0.0, 0.0, 1.0)), ctrl_z
+        )
+        return
+
     # ── Controller velocity (delayed) ──
     vel   = _ctrl_velocity(ctrl_world_pos, state, cur, props.delay_frames)
     speed = vel.length
@@ -556,6 +566,8 @@ class MANNEQUIN_OT_toggle_preview(bpy.types.Operator):
                     restored += 1
             props.hidden_gp_objects = ""
             props.preview_mode = False
+            # Reset spring state so physics starts clean from the current frame
+            _spring_state.clear()
             self.report({'INFO'},
                 f"Render mode ON — restored {restored} Grease Pencil object(s).")
 
@@ -618,18 +630,6 @@ class MANNEQUIN_PT_panel(bpy.types.Panel):
         scene  = context.scene
         props  = scene.mannequin_props
         mlist  = scene.mannequin_list
-
-        # ── Preview / Render mode toggle ──
-        row = layout.row(align=True)
-        row.alert = props.preview_mode
-        if props.preview_mode:
-            row.operator("mannequin.toggle_preview", text="Exit Preview  →  Render Mode",
-                         icon='RESTRICT_VIEW_ON')
-        else:
-            row.operator("mannequin.toggle_preview", text="Preview Mode  (Hide Line Art)",
-                         icon='RESTRICT_VIEW_OFF')
-
-        layout.separator()
 
         # ── Reference ──
         box = layout.box()
@@ -699,6 +699,20 @@ class MANNEQUIN_PT_panel(bpy.types.Panel):
         col.label(text="   — move XYZ + rotate Z to steer the character")
         col.label(text="4. Tune Tilt + Spring sliders globally")
         col.label(text="5. Reset Springs after big timeline jumps")
+
+        layout.separator()
+
+        # ── Preview / Render mode toggle ──
+        row = layout.row(align=True)
+        row.alert = props.preview_mode
+        if props.preview_mode:
+            row.operator("mannequin.toggle_preview",
+                         text="Exit Preview  →  Render Mode",
+                         icon='RESTRICT_VIEW_ON')
+        else:
+            row.operator("mannequin.toggle_preview",
+                         text="Preview Mode  (Hide Line Art)",
+                         icon='RESTRICT_VIEW_OFF')
 
 
 # ─────────────────────────────────────────────────────────────
