@@ -759,6 +759,83 @@ class MANNEQUIN_OT_reset_springs(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class MANNEQUIN_OT_bake_springs(bpy.types.Operator):
+    """Simulate spring physics for every frame in the scene range and write
+    location / rotation keyframes on all body objects.  Baked frames render
+    identically to viewport playback — no need to play the animation first."""
+    bl_idname  = "mannequin.bake_springs"
+    bl_label   = "Bake Spring Physics"
+
+    def execute(self, context):
+        scene = context.scene
+        props = scene.mannequin_props
+        mlist = scene.mannequin_list
+
+        if not mlist:
+            self.report({'WARNING'}, "No mannequins in scene.")
+            return {'CANCELLED'}
+
+        original_frame = scene.frame_current
+        # Start simulation from rest so every bake is deterministic.
+        _spring_state.clear()
+        # Disable the live handler so frame_set() inside the loop doesn't
+        # double-advance the spring integrator.
+        _unregister_handler()
+
+        baked_names: set = set()
+        try:
+            for frame in range(scene.frame_start, scene.frame_end + 1):
+                scene.frame_set(frame)      # evaluates depsgraph → ctrl positions current
+                for item in mlist:
+                    body_obj = item.body_object
+                    if body_obj is None:
+                        continue
+                    _update_mannequin(item, scene, props)
+                    body_obj.keyframe_insert(data_path='location',            frame=frame)
+                    body_obj.keyframe_insert(data_path='rotation_quaternion', frame=frame)
+                    baked_names.add(body_obj.name)
+        finally:
+            _register_handler()
+            scene.frame_set(original_frame)
+
+        n = scene.frame_end - scene.frame_start + 1
+        self.report({'INFO'},
+                    f"Baked {len(baked_names)} body object(s) over {n} frame(s). "
+                    "Render will now match viewport. Use 'Clear Bake' to remove keyframes.")
+        return {'FINISHED'}
+
+
+class MANNEQUIN_OT_clear_bake(bpy.types.Operator):
+    """Remove location / rotation keyframes written by 'Bake Spring Physics',
+    restoring live spring simulation."""
+    bl_idname  = "mannequin.clear_bake"
+    bl_label   = "Clear Spring Bake"
+
+    def execute(self, context):
+        scene = context.scene
+        mlist = scene.mannequin_list
+        cleared = 0
+        for item in mlist:
+            body_obj = item.body_object
+            if body_obj is None or body_obj.animation_data is None:
+                continue
+            action = body_obj.animation_data.action
+            if action is None:
+                continue
+            to_remove = [fc for fc in action.fcurves
+                         if fc.data_path in ('location', 'rotation_quaternion')]
+            for fc in to_remove:
+                action.fcurves.remove(fc)
+            if len(action.fcurves) == 0:
+                body_obj.animation_data_clear()
+            cleared += 1
+        if cleared:
+            _spring_state.clear()
+            mannequin_handler(scene)
+        self.report({'INFO'}, f"Cleared spring bake from {cleared} body object(s).")
+        return {'FINISHED'}
+
+
 class MANNEQUIN_OT_refresh(bpy.types.Operator):
     """Force-update all mannequin bodies at the current frame."""
     bl_idname = "mannequin.refresh"
@@ -871,7 +948,23 @@ class MANNEQUIN_PT_panel(bpy.types.Panel):
         col.label(text="3. Animate the EMPTY controller (arrows icon)")
         col.label(text="   — move XYZ + rotate Z to steer the character")
         col.label(text="4. Tune Tilt + Spring sliders globally")
-        col.label(text="5. Reset Springs after big timeline jumps")
+        col.label(text="5. Bake before rendering (see below)")
+
+        layout.separator()
+
+        # ── Render / Bake ──
+        box = layout.box()
+        box.label(text="Render", icon='RENDER_ANIMATION')
+        col = box.column(align=True)
+        col.scale_y = 0.8
+        col.label(text="Spring physics needs sequential playback to")
+        col.label(text="build up. Bake before rendering so every frame")
+        col.label(text="matches the viewport exactly.")
+        col.label(text="Re-bake after changing spring settings.")
+        box.separator()
+        row = box.row(align=True)
+        row.operator("mannequin.bake_springs", icon='PHYSICS',  text="Bake Spring Physics")
+        row.operator("mannequin.clear_bake",   icon='TRASH',    text="Clear Bake")
 
         layout.separator()
 
@@ -913,6 +1006,8 @@ classes = (
     MANNEQUIN_OT_remove,
     MANNEQUIN_OT_toggle_preview,
     MANNEQUIN_OT_reset_springs,
+    MANNEQUIN_OT_bake_springs,
+    MANNEQUIN_OT_clear_bake,
     MANNEQUIN_OT_refresh,
     MANNEQUIN_PT_panel,
 )
