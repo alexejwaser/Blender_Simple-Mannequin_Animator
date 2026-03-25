@@ -25,8 +25,6 @@ import math
 
 _spring_state: dict = {}
 _handler_running    = False
-_is_rendering       = False        # True while a render job is active
-_render_new_anim_objs: set = set() # body object names where we created animation data
 
 
 def _get_state(key, scene):
@@ -196,12 +194,6 @@ def _update_mannequin(item, scene, props):
         body_obj.rotation_mode = 'QUATERNION'
         q = mathutils.Quaternion(mathutils.Vector((0.0, 0.0, 1.0)), ctrl_z)
         body_obj.rotation_quaternion = q
-        # Cache transforms so render_pre can re-apply without re-advancing physics.
-        state["physics_frame"]  = cur
-        state["final_location"] = new_loc.copy()
-        state["final_rotation"] = q.copy()
-        if _is_rendering:
-            _try_insert_render_keyframe(body_obj, cur)
         return
 
     # ── Controller velocity (delayed) ──
@@ -253,13 +245,6 @@ def _update_mannequin(item, scene, props):
     final_q = q_tilt @ q_z
     body_obj.rotation_quaternion = final_q
 
-    # Cache transforms so render_pre can re-apply without re-advancing physics.
-    state["physics_frame"]  = cur
-    state["final_location"] = new_loc.copy()
-    state["final_rotation"] = final_q.copy()
-    if _is_rendering:
-        _try_insert_render_keyframe(body_obj, cur)
-
 
 # ─────────────────────────────────────────────────────────────
 #  Frame-change handler
@@ -291,137 +276,39 @@ def _unregister_handler():
         bpy.app.handlers.frame_change_post.remove(mannequin_handler)
 
 
-# ─────────────────────────────────────────────────────────────
-#  Render-pre handler
-#
-#  Problem: during animation rendering Blender may perform an additional
-#  depsgraph evaluation *after* frame_change_post fires (to resolve
-#  constraints and drivers for the render engine). This extra evaluation
-#  can overwrite the body-object transforms we set in mannequin_handler,
-#  causing the renderer to capture the un-sprung default rotation instead
-#  of the spring-physics result — even though the viewport looks correct.
-#
-#  Fix: register a render_pre handler that re-applies the already-computed
-#  transforms (cached in _spring_state by _update_mannequin) immediately
-#  before the render engine captures each frame.  Because the transforms
-#  are read from the cache rather than re-simulated, the spring integrator
-#  is NOT stepped a second time, so the physics remain frame-accurate.
-# ─────────────────────────────────────────────────────────────
-
-@bpy.app.handlers.persistent
-def mannequin_render_pre(scene, depsgraph=None):
-    """Re-apply cached spring transforms before each rendered frame.
-
-    Fires once per rendered frame (including every frame of an animation
-    render). If frame_change_post already ran for this frame the cached
-    location/rotation is simply rewritten to the body object; if for any
-    reason it has not yet run, _update_mannequin is called normally so
-    that the frame is never silently skipped.
-    """
-    global _handler_running
-    if _handler_running:
-        return
-    _handler_running = True
-    try:
-        mlist = scene.mannequin_list
-        if not mlist:
-            return
-        props = scene.mannequin_props
-        cur   = scene.frame_current
-        for item in mlist:
-            key      = item.name
-            state    = _spring_state.get(key)
-            body_obj = item.body_object
-            if body_obj is None:
-                continue
-
-            if (state is not None
-                    and state.get("physics_frame") == cur
-                    and "final_location" in state
-                    and "final_rotation" in state):
-                # frame_change_post already computed & cached the result —
-                # just rewrite the body transforms so the renderer sees them.
-                body_obj.rotation_mode       = 'QUATERNION'
-                body_obj.location            = state["final_location"].copy()
-                body_obj.rotation_quaternion = state["final_rotation"].copy()
-                # Also insert a keyframe so the depsgraph evaluation for
-                # rendering picks up our spring transforms (e.g. single-frame
-                # renders where frame_change_post hasn't fired for this frame).
-                _try_insert_render_keyframe(body_obj, cur)
-            else:
-                # frame_change_post has not run yet for this frame; compute now.
-                # _update_mannequin handles keyframe insertion when _is_rendering.
-                _update_mannequin(item, scene, props)
-    finally:
-        _handler_running = False
-
-
-def _try_insert_render_keyframe(body_obj, cur):
-    """Insert location/rotation keyframes during rendering so Blender's evaluated
-    depsgraph uses our spring-computed transforms rather than stored defaults.
-
-    Only acts when body_obj had no pre-existing action (to avoid disturbing
-    user-authored animation). Tracks which objects received new animation data
-    so _cleanup_render_bake can remove it afterwards.
-    """
-    name     = body_obj.name
-    had_anim = (body_obj.animation_data is not None
-                and body_obj.animation_data.action is not None)
-    if had_anim and name not in _render_new_anim_objs:
-        return  # body has user animation — don't interfere
-    if not had_anim:
-        _render_new_anim_objs.add(name)
-    body_obj.keyframe_insert(data_path='location',            frame=cur)
-    body_obj.keyframe_insert(data_path='rotation_quaternion', frame=cur)
-
-
-def _cleanup_render_bake(scene):
-    """Remove temporary animation data inserted during rendering."""
-    global _render_new_anim_objs
-    for item in scene.mannequin_list:
-        body_obj = item.body_object
-        if body_obj is not None and body_obj.name in _render_new_anim_objs:
-            body_obj.animation_data_clear()
-    _render_new_anim_objs = set()
-
-
-def _register_render_handler():
-    if mannequin_render_pre not in bpy.app.handlers.render_pre:
-        bpy.app.handlers.render_pre.append(mannequin_render_pre)
-
-
-def _unregister_render_handler():
-    if mannequin_render_pre in bpy.app.handlers.render_pre:
-        bpy.app.handlers.render_pre.remove(mannequin_render_pre)
-
 
 # ─────────────────────────────────────────────────────────────
 #  Render lifecycle handlers
 #
-#  render_init  → set _is_rendering so _update_mannequin inserts keyframes.
-#  render_complete / render_cancel → clean up those keyframes and re-run
-#  the spring handler so the viewport immediately shows the correct pose.
+#  render_init    → disable the live frame_change_post handler so it cannot
+#                   interfere with rendering.  Bodies must have baked keyframes
+#                   (via "Bake Spring Physics") — the depsgraph reads those
+#                   keyframes directly, giving frame-accurate results with no
+#                   handler ordering or double-stepping issues.
+#  render_complete / render_cancel → re-enable the live handler and
+#  refresh the viewport so it immediately shows the correct pose.
 # ─────────────────────────────────────────────────────────────
 
 @bpy.app.handlers.persistent
 def _render_init_handler(scene, depsgraph=None):
-    global _is_rendering
-    _is_rendering = True
+    # Disable live spring handler during rendering.
+    # Bodies must have baked keyframes (via "Bake Spring Physics") to render
+    # correctly — the depsgraph reads those keyframes directly without any
+    # handler interference.
+    _unregister_handler()
 
 
 @bpy.app.handlers.persistent
 def _render_complete_handler(scene, depsgraph=None):
-    global _is_rendering
-    _is_rendering = False
-    _cleanup_render_bake(scene)
+    _register_handler()
+    _spring_state.clear()
     mannequin_handler(scene)
 
 
 @bpy.app.handlers.persistent
 def _render_cancel_handler(scene, depsgraph=None):
-    global _is_rendering
-    _is_rendering = False
-    _cleanup_render_bake(scene)
+    _register_handler()
+    _spring_state.clear()
     mannequin_handler(scene)
 
 
@@ -761,8 +648,10 @@ class MANNEQUIN_OT_reset_springs(bpy.types.Operator):
 
 class MANNEQUIN_OT_bake_springs(bpy.types.Operator):
     """Simulate spring physics for every frame in the scene range and write
-    location / rotation keyframes on all body objects.  Baked frames render
-    identically to viewport playback — no need to play the animation first."""
+    location / rotation keyframes on all body objects.  Starts from a cold
+    (zero) spring state at frame_start, matching viewport playback from the
+    beginning.  Baked frames render identically to viewport — bake before
+    every render."""
     bl_idname  = "mannequin.bake_springs"
     bl_label   = "Bake Spring Physics"
 
@@ -776,34 +665,24 @@ class MANNEQUIN_OT_bake_springs(bpy.types.Operator):
             return {'CANCELLED'}
 
         original_frame = scene.frame_current
-        # Start simulation from rest so every bake is deterministic.
+        # Start simulation from rest — matches viewport playback from frame_start.
         _spring_state.clear()
         # Disable the live handler so frame_set() inside the loop doesn't
         # double-advance the spring integrator.
         _unregister_handler()
 
-        # ── Pre-warm the spring ──
-        # Simulate WARMUP_FRAMES frames before frame_start without writing
-        # keyframes. This lets the spring build up to its natural state so
-        # frame_start does not begin with an abrupt "ramping up from rest"
-        # artifact. 30 frames is enough for most stiffness / damping settings.
-        WARMUP_FRAMES = 30
-        warmup_start  = scene.frame_start - WARMUP_FRAMES
-
         baked_names: set = set()
         try:
-            for frame in range(warmup_start, scene.frame_end + 1):
-                scene.frame_set(frame)      # evaluates depsgraph → ctrl positions current
+            for frame in range(scene.frame_start, scene.frame_end + 1):
+                scene.frame_set(frame)
                 for item in mlist:
                     body_obj = item.body_object
                     if body_obj is None:
                         continue
                     _update_mannequin(item, scene, props)
-                    # Only write keyframes inside the actual scene range.
-                    if frame >= scene.frame_start:
-                        body_obj.keyframe_insert(data_path='location',            frame=frame)
-                        body_obj.keyframe_insert(data_path='rotation_quaternion', frame=frame)
-                        baked_names.add(body_obj.name)
+                    body_obj.keyframe_insert(data_path='location',            frame=frame)
+                    body_obj.keyframe_insert(data_path='rotation_quaternion', frame=frame)
+                    baked_names.add(body_obj.name)
         finally:
             _register_handler()
             scene.frame_set(original_frame)
@@ -991,7 +870,6 @@ class MANNEQUIN_PT_panel(bpy.types.Panel):
 def _load_post_handler(dummy):
     _spring_state.clear()
     _register_handler()
-    _register_render_handler()
     _register_render_state_handlers()
 
 
@@ -1021,14 +899,12 @@ def register():
     bpy.types.Scene.mannequin_props = bpy.props.PointerProperty(type=MannequinProperties)
     bpy.types.Scene.mannequin_list  = bpy.props.CollectionProperty(type=MannequinItem)
     _register_handler()
-    _register_render_handler()
     _register_render_state_handlers()
     bpy.app.handlers.load_post.append(_load_post_handler)
 
 
 def unregister():
     _unregister_handler()
-    _unregister_render_handler()
     _unregister_render_state_handlers()
     if _load_post_handler in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_load_post_handler)
