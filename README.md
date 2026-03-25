@@ -17,7 +17,8 @@ Animate an **Empty controller** — the head follows automatically, and the body
 - **Overshoot & oscillation** — body bounces naturally when stopping suddenly
 - **Multi-mannequin** — manage multiple independent characters in one scene, each in its own collection
 - **Quick build** — one click creates default sphere + cylinder reference objects
-- **Performance Mode** — hides Grease Pencil / Line Art objects and disables spring physics for smooth viewport playback; switch back to Render Mode before rendering
+- **Bake Spring Physics** — writes location/rotation keyframes for every frame so rendering reads exact spring values directly from the depsgraph; matches viewport playback identically
+- **Performance Mode** — hides Grease Pencil / Line Art objects and disables spring physics for smooth viewport playback; switch back to Render Mode before baking and rendering
 - **Scene Line Art compatible** — crash-safe with Grease Pencil Scene Line Art modifier during rendering (Blender 5.0+)
 
 ---
@@ -40,7 +41,11 @@ Requires Blender 4.0+.
 4. Keyframe the **Empty controller** (move XYZ + rotate Z to steer)
 5. Tune **Tilt** and **Spring** sliders to taste
 6. Use **Reset Springs** after large timeline jumps
-7. Enable **Performance Mode** (bottom of panel) while blocking out animation, then switch back to **Render Mode** before final rendering
+7. Enable **Performance Mode** (bottom of panel) while blocking out animation, then switch back to **Render Mode** before baking
+8. Press **Bake Spring Physics** — this writes keyframes for every frame so the renderer reads them exactly
+9. **Render Animation** — the live spring handler is automatically disabled during rendering; only baked keyframes drive the body
+
+> **Re-bake** any time you change spring settings, tilt parameters, or the controller animation.
 
 ---
 
@@ -54,6 +59,24 @@ Requires Blender 4.0+.
 | **Stiffness** | Spring snap — high = snappy, low = lazy |
 | **Damping** | Oscillation decay — ~1.0 = no bounce, ~0.3 = many swings |
 | **Tilt ×** | Per-mannequin sensitivity multiplier |
+
+---
+
+## Rendering
+
+Spring physics is a **stateful simulation** — the body rotation at frame N depends on the entire history of controller movement from frame 1. Blender's renderer does not guarantee that `frame_change_post` fires in strict sequential order for every frame, so a live handler cannot produce consistent results during rendering.
+
+**How it works:**
+
+- When rendering starts, the live `frame_change_post` handler is **automatically disabled**
+- The renderer reads body transforms from **baked keyframes** via the normal depsgraph evaluation
+- This gives frame-accurate, deterministic results with no handler-ordering or double-stepping issues
+
+**Bake behaviour:**
+
+The bake simulates the spring starting from a zero (rest) state at `frame_start`, which is the same initial condition as viewport playback when you press play from the beginning. The rendered output will match what you see when playing the animation in the viewport.
+
+**Use Clear Bake** to remove the keyframes and return to live simulation for further tweaking. Always re-bake before the next render.
 
 ---
 

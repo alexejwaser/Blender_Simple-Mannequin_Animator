@@ -180,20 +180,20 @@ def _update_mannequin(item, scene, props):
     head_world = head_obj.matrix_world.to_translation()
 
     # ── Body: position = head XY, Z = head - offset; Z rotation = controller ──
-    body_obj.location = mathutils.Vector((
+    new_loc = mathutils.Vector((
         head_world.x,
         head_world.y,
         head_world.z - item.z_offset,
     ))
+    body_obj.location = new_loc
 
     # ── Performance mode: skip spring/tilt for smooth viewport playback ──
     # Only location and Z rotation are updated, keeping depsgraph updates
     # minimal and avoiding the per-frame Line Art evaluation cascade.
     if props.preview_mode:
         body_obj.rotation_mode = 'QUATERNION'
-        body_obj.rotation_quaternion = mathutils.Quaternion(
-            mathutils.Vector((0.0, 0.0, 1.0)), ctrl_z
-        )
+        q = mathutils.Quaternion(mathutils.Vector((0.0, 0.0, 1.0)), ctrl_z)
+        body_obj.rotation_quaternion = q
         return
 
     # ── Controller velocity (delayed) ──
@@ -242,7 +242,8 @@ def _update_mannequin(item, scene, props):
     else:
         q_tilt = mathutils.Quaternion()   # identity
 
-    body_obj.rotation_quaternion = q_tilt @ q_z
+    final_q = q_tilt @ q_z
+    body_obj.rotation_quaternion = final_q
 
 
 # ─────────────────────────────────────────────────────────────
@@ -273,6 +274,61 @@ def _register_handler():
 def _unregister_handler():
     if mannequin_handler in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.remove(mannequin_handler)
+
+
+
+# ─────────────────────────────────────────────────────────────
+#  Render lifecycle handlers
+#
+#  render_init    → disable the live frame_change_post handler so it cannot
+#                   interfere with rendering.  Bodies must have baked keyframes
+#                   (via "Bake Spring Physics") — the depsgraph reads those
+#                   keyframes directly, giving frame-accurate results with no
+#                   handler ordering or double-stepping issues.
+#  render_complete / render_cancel → re-enable the live handler and
+#  refresh the viewport so it immediately shows the correct pose.
+# ─────────────────────────────────────────────────────────────
+
+@bpy.app.handlers.persistent
+def _render_init_handler(scene, depsgraph=None):
+    # Disable live spring handler during rendering.
+    # Bodies must have baked keyframes (via "Bake Spring Physics") to render
+    # correctly — the depsgraph reads those keyframes directly without any
+    # handler interference.
+    _unregister_handler()
+
+
+@bpy.app.handlers.persistent
+def _render_complete_handler(scene, depsgraph=None):
+    _register_handler()
+    _spring_state.clear()
+    mannequin_handler(scene)
+
+
+@bpy.app.handlers.persistent
+def _render_cancel_handler(scene, depsgraph=None):
+    _register_handler()
+    _spring_state.clear()
+    mannequin_handler(scene)
+
+
+def _register_render_state_handlers():
+    if _render_init_handler not in bpy.app.handlers.render_init:
+        bpy.app.handlers.render_init.append(_render_init_handler)
+    if _render_complete_handler not in bpy.app.handlers.render_complete:
+        bpy.app.handlers.render_complete.append(_render_complete_handler)
+    if _render_cancel_handler not in bpy.app.handlers.render_cancel:
+        bpy.app.handlers.render_cancel.append(_render_cancel_handler)
+
+
+def _unregister_render_state_handlers():
+    for handler, handler_list in [
+        (_render_init_handler,     bpy.app.handlers.render_init),
+        (_render_complete_handler, bpy.app.handlers.render_complete),
+        (_render_cancel_handler,   bpy.app.handlers.render_cancel),
+    ]:
+        if handler in handler_list:
+            handler_list.remove(handler)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -590,6 +646,77 @@ class MANNEQUIN_OT_reset_springs(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class MANNEQUIN_OT_bake_springs(bpy.types.Operator):
+    """Simulate spring physics for every frame in the scene range and write
+    location / rotation keyframes on all body objects.  Starts from a cold
+    (zero) spring state at frame_start, matching viewport playback from the
+    beginning.  Baked frames render identically to viewport — bake before
+    every render."""
+    bl_idname  = "mannequin.bake_springs"
+    bl_label   = "Bake Spring Physics"
+
+    def execute(self, context):
+        scene = context.scene
+        props = scene.mannequin_props
+        mlist = scene.mannequin_list
+
+        if not mlist:
+            self.report({'WARNING'}, "No mannequins in scene.")
+            return {'CANCELLED'}
+
+        original_frame = scene.frame_current
+        # Start simulation from rest — matches viewport playback from frame_start.
+        _spring_state.clear()
+        # Disable the live handler so frame_set() inside the loop doesn't
+        # double-advance the spring integrator.
+        _unregister_handler()
+
+        baked_names: set = set()
+        try:
+            for frame in range(scene.frame_start, scene.frame_end + 1):
+                scene.frame_set(frame)
+                for item in mlist:
+                    body_obj = item.body_object
+                    if body_obj is None:
+                        continue
+                    _update_mannequin(item, scene, props)
+                    body_obj.keyframe_insert(data_path='location',            frame=frame)
+                    body_obj.keyframe_insert(data_path='rotation_quaternion', frame=frame)
+                    baked_names.add(body_obj.name)
+        finally:
+            _register_handler()
+            scene.frame_set(original_frame)
+
+        n = scene.frame_end - scene.frame_start + 1
+        self.report({'INFO'},
+                    f"Baked {len(baked_names)} body object(s) over {n} frame(s). "
+                    "Render will now match viewport. Use 'Clear Bake' to remove keyframes.")
+        return {'FINISHED'}
+
+
+class MANNEQUIN_OT_clear_bake(bpy.types.Operator):
+    """Remove location / rotation keyframes written by 'Bake Spring Physics',
+    restoring live spring simulation."""
+    bl_idname  = "mannequin.clear_bake"
+    bl_label   = "Clear Spring Bake"
+
+    def execute(self, context):
+        scene = context.scene
+        mlist = scene.mannequin_list
+        cleared = 0
+        for item in mlist:
+            body_obj = item.body_object
+            if body_obj is None or body_obj.animation_data is None:
+                continue
+            body_obj.animation_data_clear()
+            cleared += 1
+        if cleared:
+            _spring_state.clear()
+            mannequin_handler(scene)
+        self.report({'INFO'}, f"Cleared spring bake from {cleared} body object(s).")
+        return {'FINISHED'}
+
+
 class MANNEQUIN_OT_refresh(bpy.types.Operator):
     """Force-update all mannequin bodies at the current frame."""
     bl_idname = "mannequin.refresh"
@@ -702,7 +829,23 @@ class MANNEQUIN_PT_panel(bpy.types.Panel):
         col.label(text="3. Animate the EMPTY controller (arrows icon)")
         col.label(text="   — move XYZ + rotate Z to steer the character")
         col.label(text="4. Tune Tilt + Spring sliders globally")
-        col.label(text="5. Reset Springs after big timeline jumps")
+        col.label(text="5. Bake before rendering (see below)")
+
+        layout.separator()
+
+        # ── Render / Bake ──
+        box = layout.box()
+        box.label(text="Render", icon='RENDER_ANIMATION')
+        col = box.column(align=True)
+        col.scale_y = 0.8
+        col.label(text="Spring physics needs sequential playback to")
+        col.label(text="build up. Bake before rendering so every frame")
+        col.label(text="matches the viewport exactly.")
+        col.label(text="Re-bake after changing spring settings.")
+        box.separator()
+        row = box.row(align=True)
+        row.operator("mannequin.bake_springs", icon='PHYSICS',  text="Bake Spring Physics")
+        row.operator("mannequin.clear_bake",   icon='TRASH',    text="Clear Bake")
 
         layout.separator()
 
@@ -727,6 +870,7 @@ class MANNEQUIN_PT_panel(bpy.types.Panel):
 def _load_post_handler(dummy):
     _spring_state.clear()
     _register_handler()
+    _register_render_state_handlers()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -742,6 +886,8 @@ classes = (
     MANNEQUIN_OT_remove,
     MANNEQUIN_OT_toggle_preview,
     MANNEQUIN_OT_reset_springs,
+    MANNEQUIN_OT_bake_springs,
+    MANNEQUIN_OT_clear_bake,
     MANNEQUIN_OT_refresh,
     MANNEQUIN_PT_panel,
 )
@@ -753,11 +899,13 @@ def register():
     bpy.types.Scene.mannequin_props = bpy.props.PointerProperty(type=MannequinProperties)
     bpy.types.Scene.mannequin_list  = bpy.props.CollectionProperty(type=MannequinItem)
     _register_handler()
+    _register_render_state_handlers()
     bpy.app.handlers.load_post.append(_load_post_handler)
 
 
 def unregister():
     _unregister_handler()
+    _unregister_render_state_handlers()
     if _load_post_handler in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_load_post_handler)
     del bpy.types.Scene.mannequin_list
