@@ -782,18 +782,28 @@ class MANNEQUIN_OT_bake_springs(bpy.types.Operator):
         # double-advance the spring integrator.
         _unregister_handler()
 
+        # ── Pre-warm the spring ──
+        # Simulate WARMUP_FRAMES frames before frame_start without writing
+        # keyframes. This lets the spring build up to its natural state so
+        # frame_start does not begin with an abrupt "ramping up from rest"
+        # artifact. 30 frames is enough for most stiffness / damping settings.
+        WARMUP_FRAMES = 30
+        warmup_start  = scene.frame_start - WARMUP_FRAMES
+
         baked_names: set = set()
         try:
-            for frame in range(scene.frame_start, scene.frame_end + 1):
+            for frame in range(warmup_start, scene.frame_end + 1):
                 scene.frame_set(frame)      # evaluates depsgraph → ctrl positions current
                 for item in mlist:
                     body_obj = item.body_object
                     if body_obj is None:
                         continue
                     _update_mannequin(item, scene, props)
-                    body_obj.keyframe_insert(data_path='location',            frame=frame)
-                    body_obj.keyframe_insert(data_path='rotation_quaternion', frame=frame)
-                    baked_names.add(body_obj.name)
+                    # Only write keyframes inside the actual scene range.
+                    if frame >= scene.frame_start:
+                        body_obj.keyframe_insert(data_path='location',            frame=frame)
+                        body_obj.keyframe_insert(data_path='rotation_quaternion', frame=frame)
+                        baked_names.add(body_obj.name)
         finally:
             _register_handler()
             scene.frame_set(original_frame)
@@ -819,15 +829,7 @@ class MANNEQUIN_OT_clear_bake(bpy.types.Operator):
             body_obj = item.body_object
             if body_obj is None or body_obj.animation_data is None:
                 continue
-            action = body_obj.animation_data.action
-            if action is None:
-                continue
-            to_remove = [fc for fc in action.fcurves
-                         if fc.data_path in ('location', 'rotation_quaternion')]
-            for fc in to_remove:
-                action.fcurves.remove(fc)
-            if len(action.fcurves) == 0:
-                body_obj.animation_data_clear()
+            body_obj.animation_data_clear()
             cleared += 1
         if cleared:
             _spring_state.clear()
