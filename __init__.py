@@ -25,6 +25,8 @@ import math
 
 _spring_state: dict = {}
 _handler_running    = False
+_is_rendering       = False        # True while a render job is active
+_render_new_anim_objs: set = set() # body object names where we created animation data
 
 
 def _get_state(key, scene):
@@ -198,6 +200,8 @@ def _update_mannequin(item, scene, props):
         state["physics_frame"]  = cur
         state["final_location"] = new_loc.copy()
         state["final_rotation"] = q.copy()
+        if _is_rendering:
+            _try_insert_render_keyframe(body_obj, cur)
         return
 
     # ── Controller velocity (delayed) ──
@@ -253,6 +257,8 @@ def _update_mannequin(item, scene, props):
     state["physics_frame"]  = cur
     state["final_location"] = new_loc.copy()
     state["final_rotation"] = final_q.copy()
+    if _is_rendering:
+        _try_insert_render_keyframe(body_obj, cur)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -338,11 +344,45 @@ def mannequin_render_pre(scene, depsgraph=None):
                 body_obj.rotation_mode       = 'QUATERNION'
                 body_obj.location            = state["final_location"].copy()
                 body_obj.rotation_quaternion = state["final_rotation"].copy()
+                # Also insert a keyframe so the depsgraph evaluation for
+                # rendering picks up our spring transforms (e.g. single-frame
+                # renders where frame_change_post hasn't fired for this frame).
+                _try_insert_render_keyframe(body_obj, cur)
             else:
                 # frame_change_post has not run yet for this frame; compute now.
+                # _update_mannequin handles keyframe insertion when _is_rendering.
                 _update_mannequin(item, scene, props)
     finally:
         _handler_running = False
+
+
+def _try_insert_render_keyframe(body_obj, cur):
+    """Insert location/rotation keyframes during rendering so Blender's evaluated
+    depsgraph uses our spring-computed transforms rather than stored defaults.
+
+    Only acts when body_obj had no pre-existing action (to avoid disturbing
+    user-authored animation). Tracks which objects received new animation data
+    so _cleanup_render_bake can remove it afterwards.
+    """
+    name     = body_obj.name
+    had_anim = (body_obj.animation_data is not None
+                and body_obj.animation_data.action is not None)
+    if had_anim and name not in _render_new_anim_objs:
+        return  # body has user animation — don't interfere
+    if not had_anim:
+        _render_new_anim_objs.add(name)
+    body_obj.keyframe_insert(data_path='location',            frame=cur)
+    body_obj.keyframe_insert(data_path='rotation_quaternion', frame=cur)
+
+
+def _cleanup_render_bake(scene):
+    """Remove temporary animation data inserted during rendering."""
+    global _render_new_anim_objs
+    for item in scene.mannequin_list:
+        body_obj = item.body_object
+        if body_obj is not None and body_obj.name in _render_new_anim_objs:
+            body_obj.animation_data_clear()
+    _render_new_anim_objs = set()
 
 
 def _register_render_handler():
@@ -353,6 +393,55 @@ def _register_render_handler():
 def _unregister_render_handler():
     if mannequin_render_pre in bpy.app.handlers.render_pre:
         bpy.app.handlers.render_pre.remove(mannequin_render_pre)
+
+
+# ─────────────────────────────────────────────────────────────
+#  Render lifecycle handlers
+#
+#  render_init  → set _is_rendering so _update_mannequin inserts keyframes.
+#  render_complete / render_cancel → clean up those keyframes and re-run
+#  the spring handler so the viewport immediately shows the correct pose.
+# ─────────────────────────────────────────────────────────────
+
+@bpy.app.handlers.persistent
+def _render_init_handler(scene, depsgraph=None):
+    global _is_rendering
+    _is_rendering = True
+
+
+@bpy.app.handlers.persistent
+def _render_complete_handler(scene, depsgraph=None):
+    global _is_rendering
+    _is_rendering = False
+    _cleanup_render_bake(scene)
+    mannequin_handler(scene)
+
+
+@bpy.app.handlers.persistent
+def _render_cancel_handler(scene, depsgraph=None):
+    global _is_rendering
+    _is_rendering = False
+    _cleanup_render_bake(scene)
+    mannequin_handler(scene)
+
+
+def _register_render_state_handlers():
+    if _render_init_handler not in bpy.app.handlers.render_init:
+        bpy.app.handlers.render_init.append(_render_init_handler)
+    if _render_complete_handler not in bpy.app.handlers.render_complete:
+        bpy.app.handlers.render_complete.append(_render_complete_handler)
+    if _render_cancel_handler not in bpy.app.handlers.render_cancel:
+        bpy.app.handlers.render_cancel.append(_render_cancel_handler)
+
+
+def _unregister_render_state_handlers():
+    for handler, handler_list in [
+        (_render_init_handler,     bpy.app.handlers.render_init),
+        (_render_complete_handler, bpy.app.handlers.render_complete),
+        (_render_cancel_handler,   bpy.app.handlers.render_cancel),
+    ]:
+        if handler in handler_list:
+            handler_list.remove(handler)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -808,6 +897,7 @@ def _load_post_handler(dummy):
     _spring_state.clear()
     _register_handler()
     _register_render_handler()
+    _register_render_state_handlers()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -835,12 +925,14 @@ def register():
     bpy.types.Scene.mannequin_list  = bpy.props.CollectionProperty(type=MannequinItem)
     _register_handler()
     _register_render_handler()
+    _register_render_state_handlers()
     bpy.app.handlers.load_post.append(_load_post_handler)
 
 
 def unregister():
     _unregister_handler()
     _unregister_render_handler()
+    _unregister_render_state_handlers()
     if _load_post_handler in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_load_post_handler)
     del bpy.types.Scene.mannequin_list
